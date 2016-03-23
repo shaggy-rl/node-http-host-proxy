@@ -17,9 +17,12 @@ var https = require('https');
 var util = require('util');
 
 var accesslog = require('access-log');
+var auth = require('basic-auth');
 var getopt = require('posix-getopt');
 var httpProxy = require('http-proxy');
-var PasshashAuth = require('passhash-auth');
+var HashP = require('hashp').HashP;
+var strsplit = require('strsplit');
+var uuid = require('node-uuid');
 
 var defaulthost = '0.0.0.0';
 var defaultport = 8080;
@@ -38,7 +41,7 @@ function usage() {
     '',
     'authentication options',
     '  -a, --auth <authfile>         [env HTTPHOSTPROXY_AUTH] enable basic http authorization',
-    '                                and use <authfile> as the `passhash-auth` file',
+    '                                and use <authfile> as the `hashp` file',
     '  -f, --fail-delay <seconds>    [env HTTPHOSTPROXY_FAIL_DELAY] delay, in seconds, before sending a response to a client',
     '                                that failed authentication, defaults to ' + defaultfaildelay,
     '',
@@ -52,16 +55,25 @@ function usage() {
     '  -p, --port <port>             [env HTTPHOSTPROXY_PORT] the port on which to listen, defaults to ' + defaultport,
     '',
     'options',
+    '  -b, --buffer                  [env HTTPHOSTPROXY_BUFFER] buffer log output, useful if this webserver is heavily used',
+    '  -d, --debug                   [env HTTPHOSTPROXY_DEBUG] print verbose logs, defaults to false',
     '  -h, --help                    print this message and exit',
     '  -u, --updates                 check for available updates on npm',
-    '  -v, --version                 print the version number and exit'
+    '  -v, --version                 print the version number and exit',
   ].join('\n');
+}
+
+function debug() {
+  if (opts.debug)
+    return console.error.apply(console, arguments);
 }
 
 // command line arguments
 var options = [
   'a:(auth)',
+  'b(buffer)',
   'c:(cert)',
+  'd(debug)',
   'f:(fail-delay)',
   'h(help)',
   'H:(host)',
@@ -76,19 +88,25 @@ var parser = new getopt.BasicParser(options, process.argv);
 
 var opts = {
   auth: process.env.HTTPHOSTPROXY_AUTH,
+  buffer: process.env.HTTPHOSTPROXY_BUFFER,
   cert: process.env.HTTPHOSTPROXY_CERT,
+  debug: process.env.HTTPHOSTPROXY_DEBUG,
   faildelay: process.env.HTTPHOSTPROXY_FAIL_DELAY,
+  gid: process.env.HTTPHOSTPROXY_GID,
   host: process.env.HTTPHOSTPROXY_HOST,
   key: process.env.HTTPHOSTPROXY_KEY,
   port: process.env.HTTPHOSTPROXY_PORT,
   routesfile: process.env.HTTPHOSTPROXY_ROUTES,
-  ssl: process.env.HTTPHOSTPROXY_SSL,
+  ssl: process.env.HTTPHOSTPROXY_SSL && process.env.HTTPHOSTPROXY !== '0',
+  uid: process.env.HTTPHOSTPROXY_UID,
 };
 var option;
 while ((option = parser.getopt()) !== undefined) {
   switch (option.option) {
     case 'a': opts.auth = option.optarg; break;
+    case 'b': opts.buffer = true; break;
     case 'c': opts.cert = option.optarg; break;
+    case 'd': opts.debug = true; break;
     case 'f': opts.faildelay = option.optarg; break;
     case 'h': console.log(usage()); process.exit(0);
     case 'H': opts.host = option.optarg; break;
@@ -125,23 +143,44 @@ if (opts.ssl && (!opts.key || !opts.cert)) {
 }
 
 // create the proxies
-var routes = JSON.parse(fs.readFileSync(opts.routesfile, 'utf-8'));
 var proxies = {};
-Object.keys(routes).forEach(function(key) {
-  var val = routes[key];
-  if (typeof val === 'string') {
-    var s = val.split(':');
-    var host = s[0];
-    var port = s[1];
-    if (!port)
-      port = host.indexOf('https') === 0 ? 443 : 80
-    val = {
-      host: host,
-      port: port
-    };
+function loadroutes(shouldthrow) {
+  debug('loading routes: %s', opts.routesfile);
+  var routes;
+  try {
+    routes = JSON.parse(fs.readFileSync(opts.routesfile, 'utf-8'));
+  } catch(e) {
+    debug('failed to load routes: %s', e.message);
+    if (shouldthrow)
+      throw e;
+    else
+      return;
   }
-  proxies[key] = new httpProxy.HttpProxy({target:val});
-});
+
+  // clear the old proxies object
+  Object.keys(proxies).forEach(function(key) {
+    delete proxies[key];
+  });
+  Object.keys(routes).forEach(function(key) {
+    var val = routes[key];
+    if (typeof val === 'string') {
+      var s = val.split(':');
+      var host = s[0];
+      var port = s[1];
+      if (!port)
+        port = host.indexOf('https') === 0 ? 443 : 80;
+      val = {
+        host: host,
+        port: port
+      };
+    }
+    debug('creating proxy: %s => %s', key, JSON.stringify(val));
+    proxies[key] = httpProxy.createProxyServer({target: val, xfwd: true});
+  });
+}
+
+loadroutes(true);
+process.on('SIGHUP', loadroutes);
 
 // create the HTTP or HTTPS server
 var server;
@@ -157,43 +196,101 @@ if (opts.ssl) {
 server.listen(opts.port, opts.host, listening);
 
 // create an authorization object if necessary
-var auth;
-if (opts.auth)
-  auth = new PasshashAuth(opts.auth);
+var hp;
+if (opts.auth) {
+  debug('using auth: %s', opts.auth);
+  hp = new HashP(fs.readFileSync(opts.auth, 'utf8'));
+}
 
 // web server started
 function listening() {
+  debug('pid: %d', process.pid);
+  // step down permissions
+  if (opts.gid) {
+    debug('changing gid to %s', opts.gid);
+    process.setgid(opts.gid);
+  }
+  if (opts.uid) {
+    debug('changing uid to %s', opts.gid);
+    process.setuid(opts.uid);
+  }
   console.log('listening on %s://%s:%d',
       opts.ssl ? 'https' : 'http', opts.host, opts.port);
+  if (opts.buffer) {
+    // buffer the logs
+    var logbuffer = require('log-buffer');
+    logbuffer(8192);
+    // flush every 5 seconds
+    setInterval(logbuffer.flush.bind(logbuffer), 5 * 1000);
+  }
 }
 
 // new web request
 function onrequest(req, res) {
+  var id = uuid.v4();
+  var now = Date.now();
+  function d() {
+    var s = util.format.apply(util, arguments);
+    return debug('[%s] %s', id, s);
+  }
+
+  d('starting request');
   // log every request with relevant information
   accesslog(req, res, function(s) {
     var prefix;
     if (opts.auth) {
       prefix = util.format('%s@%s',
-          credentials && credentials.user || '<empty>',
+          credentials && credentials.name || '<empty>',
           host || '<empty>');
     } else {
       prefix = util.format('%s',
           host || '<empty>');
     }
-    console.log('[%s] %s',
-      prefix, s);
+    var _s = util.format('[%s] %s', prefix, s);
+    if (opts.debug) {
+      d(_s);
+    } else {
+      console.log(_s);
+    }
+    d('finished request (%d ms)', Date.now() - now);
   });
 
   var host = req.headers.host;
-  var p = proxies[host];
-  var credentials = getcredentials(req);
+  d('host header `%s`', host);
+  var implicit = false;
+  var p = hasOwnProperty.call(proxies, host) && proxies[host];
+  if (!p) {
+    d('no explicit route found for %s', host);
+    implicit = true;
+    p = proxies['*'];
+  }
+  var credentials = auth(req);
 
-  // don't expose auth info to the backend service if we are handling it
-  if (opts.auth)
+  // check auth first if applicable
+  if (opts.auth) {
+    // don't expose auth info to the backend service if we are handling it
     delete req.headers.authorization;
 
+    // check if credentials were given
+    if (!credentials) {
+      d('no credentials supplied');
+      fail(res, credentials);
+      return;
+    }
+
+    // check if credentials match a known user/pass
+    if (!hp.checkMatch(credentials.name, credentials.pass)) {
+      d('credentials incorrect');
+      setTimeout(function() {
+        fail(res, credentials);
+      }, opts.faildelay * 1000);
+      return;
+    }
+  }
+
   // check host header
-  if (!host) {
+  if (!host && !implicit) {
+    d('no host header found');
     res.statusCode = 400;
     res.end('no host header found\n');
     return;
@@ -206,25 +303,16 @@ function onrequest(req, res) {
     return;
   }
 
-  // check auth
-  if (auth) {
-    // check if credentials were given
-    if (!credentials) {
-      fail(res, credentials);
-      return;
-    }
+  // everything is set, proxy it!
+  if (credentials)
+    req.headers['X-Forwarded-User'] = credentials.name;
 
-    // check if credentials match a known user/pass
-    if (!auth.checkHashMatch(credentials.user, credentials.pass)) {
-      setTimeout(function() {
-        fail(res, credentials);
-      }, opts.faildelay * 1000);
-      return;
-    }
-  }
-
-  // proxy it!
-  p.proxyRequest(req, res);
+  d('proxying request to %s:%d', p.options.target.host, p.options.target.port);
+  p.web(req, res, function(e) {
+    d('proxy failed! %s', e.message);
+    res.statusCode = 500;
+    res.end();
+  });
 }
 
 // failed auth, send auth headers back
@@ -232,24 +320,4 @@ function fail(res, creds) {
   res.setHeader('WWW-Authenticate', 'Basic realm="Auth Required"');
   res.statusCode = 401;
   res.end();
-}
-
-// extract the credentials from the req object
-function getcredentials(req) {
-  var a = req.headers.authorization;
-  if (!a || !a.indexOf('Basic ') === 0)
-    return null;
-
-  var ret = null;
-  try {
-    var s = new Buffer(a.split(' ')[1], 'base64').toString();
-    var split = s.split(':');
-    var user = split[0];
-    var pass = split[1];
-    ret = {
-      user: user,
-      pass: pass
-    };
-  } catch (e) {}
-  return ret;
 }
